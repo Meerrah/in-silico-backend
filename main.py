@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import numpy as np
@@ -142,3 +142,42 @@ def predict_toxicity(data: CohortInput):
             "crp": round(importances[1] * 100, 1)
         }
     }
+# Endpoint C: Enterprise uploads a massive CSV of clinical trial data
+@app.post("/predict/batch")
+async def predict_batch(file: UploadFile = File(...)):
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Only CSV files are permitted for batch processing.")
+    
+    try:
+        # Read the uploaded CSV directly into a Pandas DataFrame
+        df = pd.read_csv(file.file)
+        
+        # Verify the required biological markers are present
+        required_columns = ['ast', 'crp', 'dosage']
+        for col in required_columns:
+            if col not in df.columns:
+                raise HTTPException(status_code=400, detail=f"Missing critical biological marker column: {col}")
+        
+        # Isolate the core parameters for the model
+        X_batch = df[required_columns]
+        
+        # Run the Random Forest predictions across the entire dataset instantly
+        predictions = model.predict(X_batch)
+        
+        # Calculate enterprise analytics
+        total_records = len(predictions)
+        total_failed = int(np.sum(predictions))
+        total_safe = total_records - total_failed
+        pass_rate = round((total_safe / total_records) * 100, 1)
+        
+        return {
+            "status": "success",
+            "dataset_size": total_records,
+            "batch_pass_rate": pass_rate,
+            "safe_profiles": total_safe,
+            "failed_profiles": total_failed,
+            "message": f"Successfully processed {total_records} trial profiles."
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing dataset: {str(e)}")
