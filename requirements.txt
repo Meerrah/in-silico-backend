@@ -27,3 +27,5 @@ threadpoolctl==3.5.0
 typing-extensions==4.13.2
 tzdata==2026.3
 uvicorn==0.33.0
+setuptools
+wheel
