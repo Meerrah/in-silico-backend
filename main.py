@@ -1,258 +1,107 @@
-from pydantic import BaseModel, Field
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from typing import Optional, List
-from datetime import date
-import uuid
-import re
-import sqlite3
-import pytesseract
-from PIL import Image
 import io
-import csv
+import cv2
+import numpy as np
+from PIL import Image
+import pytesseract
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  
-    allow_credentials=True,
-    allow_methods=["*"],  
-    allow_headers=["*"],  
+# =====================================================================
+# 1. INITIALIZATION & CONFIGURATION
+# =====================================================================
+app = FastAPI(
+    title="In-Silico Backend Engine",
+    description="Production API for OCR processing and health tracking",
+    version="1.0.0"
 )
 
-# --- 1. SQLITE DATABASE INITIALIZATION ---
-def init_db():
-    conn = sqlite3.connect("clinical_data.db", check_same_thread=False)
-    cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, password TEXT, patient_id TEXT)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS profiles (patient_id TEXT PRIMARY KEY, blood_group TEXT, hemo_genotype TEXT, metabolic_profile TEXT)''')
-    cursor.execute('''CREATE TABLE IF NOT EXISTS ledger (record_id TEXT PRIMARY KEY, patient_id TEXT, category TEXT, date_logged TEXT, primary_content TEXT, secondary_subtext TEXT, is_monetized INTEGER, flagged_for_review INTEGER, is_voided INTEGER)''')
-    conn.commit()
-    return conn
+# Enable CORS so your Vercel frontend can safely communicate with this API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, you can swap "*" for your specific Vercel URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-db = init_db()
-
-# --- 2. AUTHENTICATION SCHEMAS & ENDPOINTS ---
-class AuthPayload(BaseModel):
-    email: str
-    password: str
-
-class PasswordResetPayload(BaseModel):
-    email: str
-    new_password: str
-
-@app.post("/auth/signup")
-async def signup(payload: AuthPayload):
-    cursor = db.cursor()
-    cursor.execute("SELECT email FROM users WHERE email = ?", (payload.email,))
-    if cursor.fetchone():
-        raise HTTPException(status_code=400, detail="Email already registered")
+# =====================================================================
+# 2. COMPUTER VISION PREPROCESSING PIPELINE
+# =====================================================================
+def clean_image_for_ocr(image_bytes: bytes) -> Image.Image:
+    """
+    Applies advanced statistical data cleaning methodologies to raw pixels.
+    Resizes, removes background noise, and eliminates uneven lighting/shadows.
+    """
+    # Convert raw uploaded bytes into an OpenCV matrix (numpy array)
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     
-    new_patient_id = f"PT-{str(uuid.uuid4().int)[:6]}"
-    cursor.execute("INSERT INTO users (email, password, patient_id) VALUES (?, ?, ?)", (payload.email, payload.password, new_patient_id))
-    cursor.execute("INSERT INTO profiles (patient_id, blood_group, hemo_genotype, metabolic_profile) VALUES (?, 'Unknown', 'Unknown', 'Unknown')", (new_patient_id,))
-    db.commit()
-    return {"message": "Account created", "patient_id": new_patient_id}
-
-@app.post("/auth/login")
-async def login(payload: AuthPayload):
-    cursor = db.cursor()
-    cursor.execute("SELECT password, patient_id FROM users WHERE email = ?", (payload.email,))
-    user = cursor.fetchone()
-    if not user or user[0] != payload.password:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    return {"message": "Login successful", "patient_id": user[1]}
-
-@app.post("/auth/reset-password")
-async def reset_password(payload: PasswordResetPayload):
-    cursor = db.cursor()
-    cursor.execute("SELECT email FROM users WHERE email = ?", (payload.email,))
-    if not cursor.fetchone():
-        raise HTTPException(status_code=404, detail="No account associated with this email.")
+    if img is None:
+        raise ValueError("Could not decode image file format.")
+        
+    # Step A: Convert image to Grayscale
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    cursor.execute("UPDATE users SET password = ? WHERE email = ?", (payload.new_password, payload.email))
-    db.commit()
-    return {"message": "Password updated successfully"}
-
-
-# --- 3. PATIENT PROFILE SCHEMAS & ENDPOINTS ---
-class PatientProfile(BaseModel):
-    blood_group: str
-    hemo_genotype: str
-    metabolic_profile: str
-
-@app.get("/profile/{patient_id}")
-async def get_profile(patient_id: str):
-    cursor = db.cursor()
-    cursor.execute("SELECT blood_group, hemo_genotype, metabolic_profile FROM profiles WHERE patient_id = ?", (patient_id,))
-    profile = cursor.fetchone()
-    if not profile:
-        raise HTTPException(status_code=404, detail="Profile not found")
-    return {"blood_group": profile[0], "hemo_genotype": profile[1], "metabolic_profile": profile[2]}
-
-@app.post("/profile/{patient_id}")
-async def update_profile(patient_id: str, profile: PatientProfile):
-    cursor = db.cursor()
-    cursor.execute("UPDATE profiles SET blood_group = ?, hemo_genotype = ?, metabolic_profile = ? WHERE patient_id = ?", 
-                  (profile.blood_group, profile.hemo_genotype, profile.metabolic_profile, patient_id))
-    db.commit()
-    return {"message": "Profile updated successfully"}
-
-
-# --- 4. TOXICITY ENGINE ---
-class DynamicTrialPayload(BaseModel):
-    target_dosage_mg: float
-    molecular_weight: float
-    lipophilicity_logp: float
-
-@app.post("/predict/dynamic/{patient_id}")
-async def predict_dynamic_toxicity(patient_id: str, payload: DynamicTrialPayload):
-    cursor = db.cursor()
-    cursor.execute("SELECT metabolic_profile FROM profiles WHERE patient_id = ?", (patient_id,))
-    profile_row = cursor.fetchone()
-    genotype = profile_row[0] if profile_row else "Unknown"
+    # Step B: Upscale the image (makes small text much easier for Tesseract to isolate)
+    gray = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_LINEAR)
     
-    cursor.execute("SELECT secondary_subtext FROM ledger WHERE patient_id = ? AND is_voided = 0 ORDER BY rowid DESC", (patient_id,))
-    ledger_rows = cursor.fetchall()
+    # Step C: Smooth out jagged edge artifacts with a light Gaussian blur
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
     
-    patient_ast = 25.0 
-    patient_crp = 1.0  
+    # Step D: Adaptive Thresholding 
+    # Calculates localized pixel intensity blocks dynamically to flatten paper background 
+    binary = cv2.adaptiveThreshold(
+        blur, 255, 
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        cv2.THRESH_BINARY, 11, 2
+    )
     
-    for (subtext,) in ledger_rows:
-        if not subtext: continue
-        if patient_ast == 25.0:
-            ast_match = re.search(r'(?:AST|Aminotransferase)[\s\w\(\)]*:\s*(\d+\.?\d*)', subtext)
-            if ast_match: patient_ast = float(ast_match.group(1))
-        if patient_crp == 1.0:
-            crp_match = re.search(r'(?:CRP|Reactive Protein)[\s\w\(\)]*:\s*(\d+\.?\d*)', subtext)
-            if crp_match: patient_crp = float(crp_match.group(1))
-            
-    confidence_score = 0.99
-    if genotype == "Unknown":
-        confidence_score = 0.60; genetic_modifier = 1.0; imputation_flag = True
-    else:
-        imputation_flag = False
-        genetic_modifier = {"Ultra-Rapid": 0.4, "Extensive": 1.0, "Intermediate": 1.5, "Poor": 3.2}.get(genotype, 1.0)
+    # Step E: Convert the OpenCV binary matrix back into a PIL Image wrapper
+    return Image.fromarray(binary)
 
-    simulated_stress_index = (payload.target_dosage_mg * payload.lipophilicity_logp * (patient_ast / 25.0)) * genetic_modifier
-    if simulated_stress_index > 400: safety_status = "CRITICAL RISK: Induced Hepatic Toxicity Expected"
-    elif simulated_stress_index > 180: safety_status = "BORDERLINE: Elevated Hepatocellular Stress Detected"
-    else: safety_status = "SAFE: Compound within calculated metabolic tolerance"
+# =====================================================================
+# 3. API ENDPOINTS / ROUTES
+# =====================================================================
 
+@app.get("/")
+def home():
+    """Root route providing a helpful status check instead of a 404."""
     return {
-        "imputed_data": imputation_flag, "confidence_score": confidence_score, 
-        "biological_clearance_multiplier": genetic_modifier, "calculated_stress_index": round(simulated_stress_index, 2), 
-        "clinical_safety_status": safety_status, "dynamic_metrics_used": {"AST": patient_ast, "CRP": patient_crp}
+        "status": "online",
+        "message": "In-Silico Engine running successfully. Append /docs to the URL to view interactive endpoints."
     }
 
-
-# --- 5. LEDGER SCHEMA & ENDPOINTS ---
-class EHRRecord(BaseModel):
-    record_id: str; patient_id: str; category: str; date_logged: date; primary_content: str
-    secondary_subtext: Optional[str] = None; is_monetized: bool = False; flagged_for_review: bool = False; is_voided: bool = False
-
-@app.post("/ledger/ingest")
-async def ingest_health_record(record: EHRRecord):
-    cursor = db.cursor()
-    cursor.execute('''INSERT INTO ledger (record_id, patient_id, category, date_logged, primary_content, secondary_subtext, is_monetized, flagged_for_review, is_voided)
-                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
-                   (record.record_id, record.patient_id, record.category, record.date_logged, record.primary_content, record.secondary_subtext, int(record.is_monetized), int(record.flagged_for_review), int(record.is_voided)))
-    db.commit()
-    return {"status": "Success"}
-
-@app.get("/ledger/history/{patient_id}")
-async def get_patient_history(patient_id: str):
-    cursor = db.cursor()
-    cursor.execute("SELECT * FROM ledger WHERE patient_id = ? ORDER BY rowid DESC", (patient_id,))
-    rows = cursor.fetchall()
-    
-    records = []
-    for r in rows:
-        records.append({
-            "record_id": r[0], "patient_id": r[1], "category": r[2], "date_logged": r[3],
-            "primary_content": r[4], "secondary_subtext": r[5], 
-            "is_monetized": bool(r[6]), "flagged_for_review": bool(r[7]), "is_voided": bool(r[8])
-        })
-    return {"records": records}
-
-@app.post("/ledger/void/{record_id}")
-async def void_health_record(record_id: str):
-    cursor = db.cursor()
-    cursor.execute("UPDATE ledger SET is_voided = 1 WHERE record_id = ?", (record_id,))
-    db.commit()
-    return {"message": "Record permanently voided"}
-
-
-# --- 6. OCR EXTRACTION & CSV EXPORT ---
 @app.post("/ledger/upload")
-async def smart_upload_document(patient_id: str = Form(...), file: UploadFile = File(...)):
-    file_bytes = await file.read()
-    
+async def extract_medical_document(file: UploadFile = File(...)):
+    """
+    Accepts image file uploads, sanitizes them via the CV2 preprocessing filter,
+    and runs highly structured OCR extraction.
+    """
+    # Prevent empty or wrong format files from hitting the pipeline
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Invalid file type. Please upload an image.")
+        
     try:
-        image = Image.open(io.BytesIO(file_bytes))
-        raw_text = pytesseract.image_to_string(image)
+        # Read the raw stream bytes from the frontend multipart form
+        contents = await file.read()
+        
+        # Pass the bytes through the computer vision filtering steps
+        cleaned_image = clean_image_for_ocr(contents)
+        
+        # Execute the layout extraction engine
+        extracted_text = pytesseract.image_to_string(cleaned_image)
+        
+        # Clean up any chaotic white space text artifacts
+        sanitized_text = extracted_text.strip()
+        
+        return {
+            "success": True,
+            "filename": file.filename,
+            "extracted_text": sanitized_text if sanitized_text else "No text could be structurally identified."
+        }
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OCR Engine Failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"OCR Engine Processing Failure: {str(e)}")
 
-    pattern = r"([A-Za-z\s\,\(\)\-]+?)\s+(\d+\.?\d*)\s+(?:[HL]\s+)?([a-zA-Z\/]+)"
-    lines = raw_text.split('\n')
-    extracted_tests = []
-    
-    for line in lines:
-        match = re.search(pattern, line)
-        if match:
-            test_name = match.group(1).strip()
-            value = match.group(2).strip()
-            unit = match.group(3).strip()
-            if len(test_name) > 3 and test_name.lower() not in ['patient name', 'parameter', 'result', 'unit', 'dob', 'gender', 'age']:
-                extracted_tests.append(f"{test_name}: {value} {unit}")
-
-    if not extracted_tests:
-        return {"status": "Failed", "detail": "No readable metrics found on document."}
-
-    aggregated_results = " • ".join(extracted_tests)
-    cursor = db.cursor()
-    rec_id = f"tx-{str(uuid.uuid4().int)[:5]}"
-    
-    cursor.execute('''INSERT INTO ledger (record_id, patient_id, category, date_logged, primary_content, secondary_subtext, is_monetized, flagged_for_review, is_voided)
-                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''', 
-                   (rec_id, patient_id, "Lab Test", str(date.today()), "Extracted: Comprehensive Lab Panel", aggregated_results, 0, 0, 0))
-    db.commit()
-    return {"status": "Success", "features_extracted": len(extracted_tests)}
-
-@app.get("/ledger/export/{patient_id}")
-async def export_patient_data(patient_id: str):
-    cursor = db.cursor()
-    
-    # 1. Fetch Profile
-    cursor.execute("SELECT blood_group, hemo_genotype, metabolic_profile FROM profiles WHERE patient_id = ?", (patient_id,))
-    profile = cursor.fetchone()
-    
-    # 2. Fetch Active Ledger Records
-    cursor.execute("SELECT date_logged, category, primary_content, secondary_subtext FROM ledger WHERE patient_id = ? AND is_voided = 0 ORDER BY date_logged DESC", (patient_id,))
-    ledger_records = cursor.fetchall()
-
-    # 3. Construct CSV in Memory with UTF-8 BOM
-    stream = io.StringIO()
-    stream.write('\ufeff')  # This specific Byte Order Mark forces Excel to read the bullet points properly!
-    writer = csv.writer(stream)
-    
-    writer.writerow(["IN-SILICO PASSPORT: CLINICAL DATA EXPORT"])
-    writer.writerow(["Patient ID", patient_id])
-    if profile:
-        writer.writerow(["Blood Group", profile[0]])
-        writer.writerow(["Genotype", profile[1]])
-        writer.writerow(["Metabolic Profile", profile[2]])
-        
-    writer.writerow([])
-    writer.writerow(["Date", "Category", "Event", "Clinical Notes/Values"])
-    
-    for record in ledger_records:
-        writer.writerow([record[0], record[1], record[2], record[3]])
-        
-    # 4. Stream back to client as a downloadable file
-    response = StreamingResponse(iter([stream.getvalue()]), media_type="text/csv")
-    response.headers["Content-Disposition"] = f"attachment; filename=health_passport_{patient_id}.csv"
-    return response
+# Keep your existing auth and user data logic below this line if applicable:
+# @app.post("/auth/login") ...
