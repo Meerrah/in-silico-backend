@@ -41,7 +41,6 @@ def init_db():
     cursor.execute('''CREATE TABLE IF NOT EXISTS users (email TEXT PRIMARY KEY, password TEXT, patient_id TEXT)''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS profiles (patient_id TEXT PRIMARY KEY, blood_group TEXT, hemo_genotype TEXT, metabolic_profile TEXT)''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS ledger (record_id TEXT PRIMARY KEY, patient_id TEXT, category TEXT, date_logged TEXT, primary_content TEXT, secondary_subtext TEXT, is_monetized INTEGER, flagged_for_review INTEGER, is_voided INTEGER)''')
-    # NEW: Table for secure password resets
     cursor.execute('''CREATE TABLE IF NOT EXISTS otps (email TEXT PRIMARY KEY, code TEXT, expiry REAL)''')
     conn.commit()
     return conn
@@ -111,19 +110,6 @@ def send_otp_email(receiver_email: str, otp_code: str):
     print(f"To: {receiver_email}")
     print(f"Your In-Silico Password Reset Code is: {otp_code}")
     print(f"{'='*50}\n")
-
-    # To make this live, configure a Gmail App Password and uncomment below:
-    # try:
-    #     msg = EmailMessage()
-    #     msg.set_content(f"Your In-Silico Passport password reset code is: {otp_code}\nThis code expires in 15 minutes.")
-    #     msg['Subject'] = "In-Silico Password Reset Code"
-    #     msg['From'] = "YOUR_GMAIL_ADDRESS@gmail.com"
-    #     msg['To'] = receiver_email
-    #     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-    #         server.login("YOUR_GMAIL_ADDRESS@gmail.com", "YOUR_GMAIL_APP_PASSWORD")
-    #         server.send_message(msg)
-    # except Exception as e:
-    #     print(f"SMTP Server Error: {e}")
 
 @app.get("/")
 def home():
@@ -309,7 +295,6 @@ async def smart_upload_document(patient_id: str = Form(...), file: UploadFile = 
     file_bytes = await file.read()
 
     try:
-        # Computer Vision Cleanup
         cleaned_image = clean_image_for_ocr(file_bytes)
         custom_config = r'--oem 3 --psm 6'
         raw_text = pytesseract.image_to_string(cleaned_image, config=custom_config)
@@ -319,16 +304,17 @@ async def smart_upload_document(patient_id: str = Form(...), file: UploadFile = 
     if not raw_text.strip():
         return {"status": "Failed", "detail": "Document is completely blank or unreadable."}
 
-    # Extraction Pass 1: Standard Numeric Labs (e.g., "Glucose 92.0 mg/dL")
     pattern_numeric = r"([A-Za-z\s\,\(\)\-]+?)\s+(\d+\.\d+|\d+)\s*(?:[HL]\s*)?([a-zA-Z\/%]+)"
-    # Extraction Pass 2: Qualitative/Categorical Labs (e.g., "Nitrites: Positive")
     pattern_categorical = r"([A-Za-z\s\,\(\)\-]+?):\s*([A-Za-z0-9\-\>]+(?:\s\([A-Za-z]\))?)"
 
     lines = raw_text.split('\n')
     extracted_tests = []
+    
+    # Aggressive stop-words to prevent document headers from being parsed as lab tests
+    exclusions = ['patient', 'parameter', 'result', 'unit', 'dob', 'gender', 'age', 'date', 'specimen', 'subject', 'reference', 'verified', 'electronic', 'signature']
 
     for line in lines:
-        clean_line = line.replace('|', '').replace('[', '').replace(']', '')
+        clean_line = line.replace('|', '').replace('[', '').replace(']', '').replace('_', '')
         
         # Try Numeric Match
         match_num = re.search(pattern_numeric, clean_line)
@@ -336,7 +322,8 @@ async def smart_upload_document(patient_id: str = Form(...), file: UploadFile = 
             test_name = match_num.group(1).strip()
             value = match_num.group(2).strip()
             unit = match_num.group(3).strip()
-            if len(test_name) > 3 and test_name.lower() not in ['patient name', 'parameter', 'result', 'unit', 'dob', 'gender', 'age']:
+            
+            if len(test_name) > 3 and not any(ex in test_name.lower() for ex in exclusions):
                 extracted_tests.append(f"{test_name}: {value} {unit}")
             continue
             
@@ -345,18 +332,19 @@ async def smart_upload_document(patient_id: str = Form(...), file: UploadFile = 
         if match_cat:
             test_name = match_cat.group(1).strip()
             value = match_cat.group(2).strip()
-            if len(test_name) > 3 and test_name.lower() not in ['patient name', 'date collected', 'specimen type', 'patient id', 'age/gender', 'date']:
+            
+            if len(test_name) > 3 and not any(ex in test_name.lower() for ex in exclusions):
                 extracted_tests.append(f"{test_name}: {value}")
 
     cursor = db.cursor()
     rec_id = f"tx-{str(uuid.uuid4().int)[:5]}"
 
     # Routing Path A: Structured Lab Data Found
-    if extracted_tests:
+    if len(extracted_tests) > 0:
         aggregated_results = " • ".join(extracted_tests)
         cursor.execute('''INSERT INTO ledger (record_id, patient_id, category, date_logged, primary_content, secondary_subtext, is_monetized, flagged_for_review, is_voided)
                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                       (rec_id, patient_id, "Lab Test", str(date.today()), "AI Extracted: Diagnostics Panel", aggregated_results, 0, 0, 0))
+                       (rec_id, patient_id, "Lab Test", str(date.today()), "Extracted: Comprehensive Lab Panel", aggregated_results, 0, 0, 0))
         db.commit()
         return {"status": "Success", "features_extracted": len(extracted_tests), "type": "Lab Data"}
 
@@ -369,7 +357,7 @@ async def smart_upload_document(patient_id: str = Form(...), file: UploadFile = 
     
     cursor.execute('''INSERT INTO ledger (record_id, patient_id, category, date_logged, primary_content, secondary_subtext, is_monetized, flagged_for_review, is_voided)
                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                   (rec_id, patient_id, "Clinical Visit", str(date.today()), "AI Extracted: Clinical Document", summary, 0, 0, 0))
+                   (rec_id, patient_id, "Clinical Visit", str(date.today()), "Extracted: Clinical Document", summary, 0, 0, 0))
     db.commit()
     
     return {"status": "Success", "features_extracted": "Text Block", "type": "Clinical Note"}
