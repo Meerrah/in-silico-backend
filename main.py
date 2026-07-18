@@ -53,37 +53,37 @@ db = init_db()
 # =====================================================================
 def clean_image_for_ocr(image_bytes: bytes) -> Image.Image:
     """
-    Dynamically preprocesses images. 
+    Dynamically preprocesses images.
     Keeps clean documents untouched while gently cleaning shadows from complex photos.
     """
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    
+
     if img is None:
         raise ValueError("Could not decode image file format.")
-        
+
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
+
     # Calculate image variance to determine contrast/noise
     variance = cv2.Laplacian(gray, cv2.CV_64F).var()
-    
+
     # Resize (always beneficial for Tesseract)
     gray = cv2.resize(gray, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
-    
+
     # If the image is highly clear and clean, bypass heavy thresholding
     if variance < 100:
         return Image.fromarray(gray)
-        
+
     # Apply a gentler bilateral filter
     denoised = cv2.bilateralFilter(gray, 9, 75, 75)
-    
+
     # Dialed-back Adaptive Thresholding
     binary = cv2.adaptiveThreshold(
-        denoised, 255, 
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        denoised, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY, 21, 10
     )
-    
+
     return Image.fromarray(binary)
 
 # =====================================================================
@@ -103,7 +103,7 @@ class PasswordResetPayload(BaseModel):
 
 def send_otp_email(receiver_email: str, otp_code: str):
     """
-    Handles sending the confirmation code. Currently mocks the email by logging it 
+    Handles sending the confirmation code. Currently mocks the email by logging it
     to the server console so you can test it without setting up SMTP credentials yet.
     """
     print(f"\n{'='*50}")
@@ -111,7 +111,7 @@ def send_otp_email(receiver_email: str, otp_code: str):
     print(f"To: {receiver_email}")
     print(f"Your In-Silico Password Reset Code is: {otp_code}")
     print(f"{'='*50}\n")
-    
+
     # To make this live, configure a Gmail App Password and uncomment below:
     # try:
     #     msg = EmailMessage()
@@ -299,46 +299,80 @@ async def void_health_record(record_id: str):
     return {"message": "Record permanently voided"}
 
 # =====================================================================
-# 7. PRODUCTION OCR ENGINE WITH COMPUTER VISION PIPELINE
+# 7. PRODUCTION OCR ENGINE WITH COMPUTER VISION PIPELINE (OMNI-EXTRACTOR)
 # =====================================================================
 @app.post("/ledger/upload")
 async def smart_upload_document(patient_id: str = Form(...), file: UploadFile = File(...)):
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Invalid file type. Please upload an image.")
-        
+
     file_bytes = await file.read()
 
     try:
+        # Computer Vision Cleanup
         cleaned_image = clean_image_for_ocr(file_bytes)
-        raw_text = pytesseract.image_to_string(cleaned_image)
+        custom_config = r'--oem 3 --psm 6'
+        raw_text = pytesseract.image_to_string(cleaned_image, config=custom_config)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"OCR Engine Processing Failure: {str(e)}")
 
-    pattern = r"([A-Za-z\s\,\(\)\-]+?)\s+(\d+\.?\d*)\s+(?:[HL]\s+)?([a-zA-Z\/]+)"
+    if not raw_text.strip():
+        return {"status": "Failed", "detail": "Document is completely blank or unreadable."}
+
+    # Extraction Pass 1: Standard Numeric Labs (e.g., "Glucose 92.0 mg/dL")
+    pattern_numeric = r"([A-Za-z\s\,\(\)\-]+?)\s+(\d+\.\d+|\d+)\s*(?:[HL]\s*)?([a-zA-Z\/%]+)"
+    # Extraction Pass 2: Qualitative/Categorical Labs (e.g., "Nitrites: Positive")
+    pattern_categorical = r"([A-Za-z\s\,\(\)\-]+?):\s*([A-Za-z0-9\-\>]+(?:\s\([A-Za-z]\))?)"
+
     lines = raw_text.split('\n')
     extracted_tests = []
 
     for line in lines:
-        match = re.search(pattern, line)
-        if match:
-            test_name = match.group(1).strip()
-            value = match.group(2).strip()
-            unit = match.group(3).strip()
+        clean_line = line.replace('|', '').replace('[', '').replace(']', '')
+        
+        # Try Numeric Match
+        match_num = re.search(pattern_numeric, clean_line)
+        if match_num:
+            test_name = match_num.group(1).strip()
+            value = match_num.group(2).strip()
+            unit = match_num.group(3).strip()
             if len(test_name) > 3 and test_name.lower() not in ['patient name', 'parameter', 'result', 'unit', 'dob', 'gender', 'age']:
                 extracted_tests.append(f"{test_name}: {value} {unit}")
+            continue
+            
+        # Try Categorical Match
+        match_cat = re.search(pattern_categorical, clean_line)
+        if match_cat:
+            test_name = match_cat.group(1).strip()
+            value = match_cat.group(2).strip()
+            if len(test_name) > 3 and test_name.lower() not in ['patient name', 'date collected', 'specimen type', 'patient id', 'age/gender', 'date']:
+                extracted_tests.append(f"{test_name}: {value}")
 
-    if not extracted_tests:
-        return {"status": "Failed", "detail": "No readable metrics could be identified on this document configuration."}
-
-    aggregated_results = " • ".join(extracted_tests)
     cursor = db.cursor()
     rec_id = f"tx-{str(uuid.uuid4().int)[:5]}"
 
+    # Routing Path A: Structured Lab Data Found
+    if extracted_tests:
+        aggregated_results = " • ".join(extracted_tests)
+        cursor.execute('''INSERT INTO ledger (record_id, patient_id, category, date_logged, primary_content, secondary_subtext, is_monetized, flagged_for_review, is_voided)
+                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                       (rec_id, patient_id, "Lab Test", str(date.today()), "AI Extracted: Diagnostics Panel", aggregated_results, 0, 0, 0))
+        db.commit()
+        return {"status": "Success", "features_extracted": len(extracted_tests), "type": "Lab Data"}
+
+    # Routing Path B: Free-Form Text Found (Treat as Doctor's Note)
+    clean_text = " ".join([line.strip() for line in lines if len(line.strip()) > 8])
+    if len(clean_text) < 20:
+        return {"status": "Failed", "detail": "No readable metrics or clinical text could be identified."}
+
+    summary = clean_text[:250] + "..." if len(clean_text) > 250 else clean_text
+    
     cursor.execute('''INSERT INTO ledger (record_id, patient_id, category, date_logged, primary_content, secondary_subtext, is_monetized, flagged_for_review, is_voided)
                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                   (rec_id, patient_id, "Lab Test", str(date.today()), "Extracted: Comprehensive Lab Panel", aggregated_results, 0, 0, 0))
+                   (rec_id, patient_id, "Clinical Visit", str(date.today()), "AI Extracted: Clinical Document", summary, 0, 0, 0))
     db.commit()
-    return {"status": "Success", "features_extracted": len(extracted_tests)}
+    
+    return {"status": "Success", "features_extracted": "Text Block", "type": "Clinical Note"}
 
 # =====================================================================
 # 8. METRICS EXPORT
@@ -353,7 +387,7 @@ async def export_patient_data(patient_id: str):
     ledger_records = cursor.fetchall()
 
     stream = io.StringIO()
-    stream.write('\ufeff')  
+    stream.write('\ufeff')
     writer = csv.writer(stream)
 
     writer.writerow(["IN-SILICO PASSPORT: CLINICAL DATA EXPORT"])
